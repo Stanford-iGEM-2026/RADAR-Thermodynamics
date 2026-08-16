@@ -15,10 +15,11 @@ candidate sequences and score endogenous RNA structural accessibility.
 
 import json
 import os
-from io import BytesIO
+import zipfile
 from pathlib import Path
 
 import pandas as pd
+import requests
 import sqlite3
 import streamlit as st
 
@@ -26,15 +27,19 @@ from fasta import render_ncbi_fasta_tab
 
 DB_PATH = Path("radar_candidates.db")
 CATALOG_PATH = Path("gene_catalog.json")
+ARCHIVE_PATH = Path("radar_genes.zip")
 TABLE_NAME = "candidates"
 GENE_COLUMN = "gene"
 
 # Per-gene CSVs, hosted as a GitHub Release asset (not in git).
+# GitHub's release CDN does not support HTTP Range requests, so the cloud
+# app downloads this ZIP once, caches it on disk, then reads one gene.
 # Override with Streamlit secret or env RADAR_GENE_ARCHIVE_URL if needed.
 DEFAULT_ARCHIVE_URL = (
     "https://github.com/Stanford-iGEM-2026/RADAR-Thermodynamics/"
     "releases/download/radar-data-v1/radar_genes.zip"
 )
+MIN_ARCHIVE_BYTES = 100_000_000
 
 # Original Gao Lab columns, in file order. We keep all of them.
 GAO_COLUMNS = [
@@ -65,12 +70,16 @@ DERIVED_COLUMNS = [
 # ---------------------------------------------------------------------------
 
 def archive_url():
-    """GitHub Release ZIP with one CSV per gene. Only that gene is downloaded."""
+    """GitHub Release ZIP with one CSV per gene."""
     try:
         from_secrets = st.secrets.get("RADAR_GENE_ARCHIVE_URL")
     except Exception:
         from_secrets = None
     return from_secrets or os.environ.get("RADAR_GENE_ARCHIVE_URL") or DEFAULT_ARCHIVE_URL
+
+
+def archive_is_ready(path=ARCHIVE_PATH):
+    return path.exists() and path.stat().st_size >= MIN_ARCHIVE_BYTES
 
 
 @st.cache_data(show_spinner=False)
@@ -88,11 +97,39 @@ def resolve_gene_symbol(gene_symbol):
     return catalog.get(gene_symbol.lower())
 
 
-@st.cache_resource(show_spinner=False)
-def open_gene_archive():
-    from remotezip import RemoteZip
+@st.cache_resource(show_spinner="Downloading RADAR gene archive (once, then cached)...")
+def ensure_gene_archive():
+    """
+    Make radar_genes.zip available on disk.
 
-    return RemoteZip(archive_url())
+    GitHub release assets return 501 for Range requests, so we download the
+    full ZIP once with a normal GET and reuse it for later gene lookups.
+    """
+    if archive_is_ready():
+        return str(ARCHIVE_PATH.resolve())
+
+    url = archive_url()
+    part_path = ARCHIVE_PATH.with_suffix(".zip.part")
+    headers = {
+        "Accept": "application/octet-stream",
+        "User-Agent": "RADAR-Thermodynamics-streamlit",
+    }
+    with requests.get(url, headers=headers, stream=True, timeout=(30, 600)) as response:
+        response.raise_for_status()
+        with part_path.open("wb") as handle:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    handle.write(chunk)
+
+    if not archive_is_ready(part_path):
+        size = part_path.stat().st_size if part_path.exists() else 0
+        part_path.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"Archive download looked incomplete ({size:,} bytes). "
+            "Check GitHub Release radar-data-v1 / radar_genes.zip."
+        )
+    part_path.replace(ARCHIVE_PATH)
+    return str(ARCHIVE_PATH.resolve())
 
 
 def fetch_candidates_sqlite(gene_symbol):
@@ -115,11 +152,12 @@ def fetch_candidates_sqlite(gene_symbol):
 
 
 def fetch_candidates_archive(canonical_gene):
-    """Download only `{gene}.csv` from the hosted ZIP (HTTP range request)."""
-    archive = open_gene_archive()
+    """Read `{gene}.csv` from the cached ZIP (downloaded once on the cloud)."""
+    ensure_gene_archive()
     member = f"{canonical_gene}.csv"
-    with archive.open(member) as handle:
-        return pd.read_csv(BytesIO(handle.read()))
+    with zipfile.ZipFile(ARCHIVE_PATH) as archive:
+        with archive.open(member) as handle:
+            return pd.read_csv(handle)
 
 
 @st.cache_data(show_spinner=False)
@@ -128,7 +166,7 @@ def fetch_candidates(gene_symbol):
     Load every Gao RADAR row for one gene.
 
     Locally: query radar_candidates.db.
-    On Streamlit Cloud: fetch that gene's CSV from the Release ZIP.
+    On Streamlit Cloud: use the cached Release ZIP and read that gene's CSV.
     """
     if DB_PATH.exists():
         return fetch_candidates_sqlite(gene_symbol)
@@ -331,7 +369,10 @@ def render_radar_tab(gene):
         if DB_PATH.exists():
             raw = fetch_candidates(gene)
         else:
-            with st.spinner(f"Loading {gene} from the hosted archive (one gene only)..."):
+            with st.spinner(
+                f"Loading {gene}. The first cloud search downloads the "
+                "archive once (~280 MB), then later genes are fast."
+            ):
                 raw = fetch_candidates(gene)
     except Exception as exc:
         if DB_PATH.exists():
