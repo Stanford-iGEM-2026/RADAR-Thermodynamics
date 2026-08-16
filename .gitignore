@@ -1,6 +1,9 @@
 __pycache__/
 *.pyc
 radar_candidates.db
+radar_candidates.db-shm
+radar_candidates.db-wal
+radar_genes.zip
 human_RADAR_sensor_candidates.csv.gz
 sequences.txt
 .streamlit/

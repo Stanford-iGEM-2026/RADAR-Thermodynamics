@@ -13,6 +13,9 @@ Later (not in this version): a second stage can take the transcript IDs plus
 candidate sequences and score endogenous RNA structural accessibility.
 """
 
+import json
+import os
+from io import BytesIO
 from pathlib import Path
 
 import pandas as pd
@@ -22,8 +25,16 @@ import streamlit as st
 from fasta import render_ncbi_fasta_tab
 
 DB_PATH = Path("radar_candidates.db")
+CATALOG_PATH = Path("gene_catalog.json")
 TABLE_NAME = "candidates"
 GENE_COLUMN = "gene"
+
+# Per-gene CSVs, hosted as a GitHub Release asset (not in git).
+# Override with Streamlit secret or env RADAR_GENE_ARCHIVE_URL if needed.
+DEFAULT_ARCHIVE_URL = (
+    "https://github.com/Stanford-iGEM-2026/RADAR-Thermodynamics/"
+    "releases/download/radar-data-v1/radar_genes.zip"
+)
 
 # Original Gao Lab columns, in file order. We keep all of them.
 GAO_COLUMNS = [
@@ -50,13 +61,43 @@ DERIVED_COLUMNS = [
 
 
 # ---------------------------------------------------------------------------
-# Database
+# Database (local SQLite) or one-gene fetch from the hosted ZIP
 # ---------------------------------------------------------------------------
 
+def archive_url():
+    """GitHub Release ZIP with one CSV per gene. Only that gene is downloaded."""
+    try:
+        from_secrets = st.secrets.get("RADAR_GENE_ARCHIVE_URL")
+    except Exception:
+        from_secrets = None
+    return from_secrets or os.environ.get("RADAR_GENE_ARCHIVE_URL") or DEFAULT_ARCHIVE_URL
+
+
 @st.cache_data(show_spinner=False)
-def fetch_candidates(gene_symbol):
+def load_gene_catalog():
+    """Map lowercase gene symbol -> exact Gao symbol used as the ZIP member name."""
+    if not CATALOG_PATH.exists():
+        return {}
+    return json.loads(CATALOG_PATH.read_text())
+
+
+def resolve_gene_symbol(gene_symbol):
+    catalog = load_gene_catalog()
+    if not catalog:
+        return gene_symbol
+    return catalog.get(gene_symbol.lower())
+
+
+@st.cache_resource(show_spinner=False)
+def open_gene_archive():
+    from remotezip import RemoteZip
+
+    return RemoteZip(archive_url())
+
+
+def fetch_candidates_sqlite(gene_symbol):
     """
-    Load every Gao RADAR row for one gene.
+    Load every Gao RADAR row for one gene from the local SQLite file.
 
     Only this gene enters RAM. COLLATE NOCASE lets ADAM12 and adam12 match.
     The gene string is a SQL parameter, not pasted into the query text.
@@ -71,6 +112,49 @@ def fetch_candidates(gene_symbol):
         return pd.read_sql_query(query, connection, params=(gene_symbol,))
     finally:
         connection.close()
+
+
+def fetch_candidates_archive(canonical_gene):
+    """Download only `{gene}.csv` from the hosted ZIP (HTTP range request)."""
+    archive = open_gene_archive()
+    member = f"{canonical_gene}.csv"
+    with archive.open(member) as handle:
+        return pd.read_csv(BytesIO(handle.read()))
+
+
+@st.cache_data(show_spinner=False)
+def fetch_candidates(gene_symbol):
+    """
+    Load every Gao RADAR row for one gene.
+
+    Locally: query radar_candidates.db.
+    On Streamlit Cloud: fetch that gene's CSV from the Release ZIP.
+    """
+    if DB_PATH.exists():
+        return fetch_candidates_sqlite(gene_symbol)
+
+    canonical = resolve_gene_symbol(gene_symbol)
+    if canonical is None:
+        return pd.DataFrame()
+    return fetch_candidates_archive(canonical)
+
+
+def radar_source_status():
+    """
+    Ready if the local DB exists, or if we have a gene catalog and can use
+    the hosted per-gene ZIP (nothing heavy is downloaded until a search).
+    """
+    if DB_PATH.exists():
+        return "ok", None
+    if CATALOG_PATH.exists():
+        return "ok", None
+    return (
+        "missing",
+        "No local database and no gene catalog. "
+        "On your laptop run `python build_database.py`, then "
+        "`python export_gene_archive.py`, and upload radar_genes.zip "
+        "to GitHub Release radar-data-v1.",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -230,18 +314,35 @@ def display_columns(frame):
 
 def render_radar_tab(gene):
     """Gao Lab RADAR candidate table, filters, and CSV download."""
-    if not DB_PATH.exists():
-        st.error(
-            "Database not found. From this folder run:\n\n"
-            "`python build_database.py`"
-        )
+    status, detail = radar_source_status()
+    if status != "ok":
+        st.error(detail)
         return
 
     if not gene:
         st.info("Type a gene symbol (for example POSTN, GAPDH, or MYC).")
         return
 
-    raw = fetch_candidates(gene)
+    if not DB_PATH.exists() and resolve_gene_symbol(gene) is None:
+        st.warning(f"No RADAR candidates found for {gene}.")
+        return
+
+    try:
+        if DB_PATH.exists():
+            raw = fetch_candidates(gene)
+        else:
+            with st.spinner(f"Loading {gene} from the hosted archive (one gene only)..."):
+                raw = fetch_candidates(gene)
+    except Exception as exc:
+        if DB_PATH.exists():
+            raise
+        st.error(
+            "Could not load this gene from the hosted archive. "
+            "Upload `radar_genes.zip` to GitHub Release **radar-data-v1**, "
+            "or set secret `RADAR_GENE_ARCHIVE_URL`. "
+            f"({exc})"
+        )
+        return
 
     if raw.empty:
         st.warning(f"No RADAR candidates found for {gene}.")
