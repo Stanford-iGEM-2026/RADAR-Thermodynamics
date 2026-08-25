@@ -10,30 +10,105 @@ is unchanged. Only the data source is Ensembl REST, so IDs match Gao ENST labels
 """
 
 import json
+import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
+import requests
 import streamlit as st
 
 ENSEMBL_REST = "https://rest.ensembl.org"
 USER_AGENT = "RADAR-Thermodynamics/1.0 (gene FASTA lookup)"
+_RETRY_STATUSES = {429, 500, 502, 503, 504}
+_MAX_ATTEMPTS = 4
+_PROXY_ENV_VARS = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+)
 
 
-def _ensembl_get(path, accept="application/json"):
-    """GET one Ensembl REST URL. Returns bytes."""
+def _ensembl_get(path, accept="application/json", max_attempts=None):
+    """GET one Ensembl REST URL. Returns bytes.
+
+    Skip HTTPS_PROXY (Cursor's local proxy 403s CONNECT).
+    Retry 429/500/502/503/504 — Ensembl often returns 503/500 when busy.
+    """
     url = f"{ENSEMBL_REST}{path}"
-    request = urllib.request.Request(
-        url,
-        headers={"Accept": accept, "User-Agent": USER_AGENT},
-    )
-    with urllib.request.urlopen(request, timeout=60) as response:
-        return response.read()
+    headers = {"Accept": accept, "User-Agent": USER_AGENT}
+    saved = {key: os.environ.pop(key, None) for key in _PROXY_ENV_VARS}
+    last_status = None
+    attempts = _MAX_ATTEMPTS if max_attempts is None else max_attempts
+    try:
+        session = requests.Session()
+        session.trust_env = False
+        for attempt in range(attempts):
+            response = session.get(
+                url,
+                headers=headers,
+                timeout=60,
+                proxies={"http": None, "https": None},
+            )
+            if response.status_code in (400, 404):
+                raise urllib.error.HTTPError(
+                    url, response.status_code, response.reason, response.headers, None
+                )
+            if response.status_code in _RETRY_STATUSES:
+                last_status = response.status_code
+                if attempt < attempts - 1:
+                    wait = min(8.0, 1.5 * (2 ** attempt))
+                    retry_after = response.headers.get("Retry-After")
+                    if retry_after and retry_after.isdigit():
+                        wait = min(15.0, float(retry_after))
+                    time.sleep(wait)
+                continue
+            response.raise_for_status()
+            return response.content
+        raise ValueError(
+            "Ensembl REST is temporarily unavailable "
+            f"(HTTP {last_status}). Their server is busy — wait a minute "
+            "and click Get FASTA again. This is not a problem with the gene name."
+        )
+    finally:
+        for key, value in saved.items():
+            if value is not None:
+                os.environ[key] = value
 
 
 def _core_id(ensembl_id):
     """ENST00000368679.9 -> ENST00000368679 (version-independent)."""
     return str(ensembl_id).split(".")[0]
+
+
+def _fetch_transcripts_one_by_one(transcripts):
+    """If Ensembl's multi-FASTA call fails, download each ENST sequence separately."""
+    chunks = []
+    for tx in transcripts:
+        tx_id = tx.get("id")
+        if not tx_id:
+            continue
+        try:
+            chunk = _ensembl_get(
+                f"/sequence/id/{tx_id}?type=cdna",
+                accept="text/x-fasta",
+                max_attempts=2,
+            ).decode("utf-8")
+        except (urllib.error.HTTPError, requests.RequestException, ValueError):
+            continue
+        if chunk.strip().startswith(">"):
+            chunks.append(chunk.strip())
+        time.sleep(0.12)
+    if not chunks:
+        raise ValueError(
+            "Ensembl REST is temporarily failing on sequence download. "
+            "Wait a minute and click Get FASTA again."
+        )
+    return "\n".join(chunks) + "\n"
 
 
 def download_transcript_fasta(gene_symbol):
@@ -73,8 +148,8 @@ def download_transcript_fasta(gene_symbol):
     fasta_path = f"/sequence/id/{gene_id}?type=cdna&multiple_sequences=1"
     try:
         fasta_text = _ensembl_get(fasta_path, accept="text/x-fasta").decode("utf-8")
-    except urllib.error.HTTPError as error:
-        raise ValueError(f"Ensembl sequence download failed (HTTP {error.code}).") from error
+    except (urllib.error.HTTPError, requests.RequestException, ValueError):
+        fasta_text = _fetch_transcripts_one_by_one(transcripts)
 
     if not fasta_text.strip().startswith(">"):
         raise ValueError("Ensembl returned no transcript FASTA for this gene.")
@@ -134,14 +209,21 @@ def render_ncbi_fasta_tab(gene_symbol):
 
     if st.button("Get FASTA", key="get_ncbi_fasta"):
         try:
-            with st.spinner(f"Downloading Ensembl transcripts for {gene_symbol} ..."):
+            with st.spinner(
+                f"Downloading Ensembl transcripts for {gene_symbol} "
+                "(retries if their server is busy) ..."
+            ):
                 fasta_text, biotype_by_id = download_transcript_fasta(gene_symbol)
         except ValueError as e:
             st.error(str(e))
             return
-        except urllib.error.URLError as e:
+        except (urllib.error.URLError, requests.RequestException) as e:
             st.error("Could not reach Ensembl REST.")
             st.code(str(e))
+            st.caption(
+                "If this mentions a proxy or 403, the app is supposed to skip "
+                "the local proxy. Refresh the page and click Get FASTA again."
+            )
             return
 
         st.session_state["ncbi_fasta_gene"] = gene_symbol.strip().upper()
