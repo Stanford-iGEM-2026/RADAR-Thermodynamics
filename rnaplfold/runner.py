@@ -9,6 +9,7 @@ import tempfile
 
 DEFAULT_BINARY_CANDIDATES = (
     "RNAplfold",
+    "/usr/bin/RNAplfold",
     "/opt/homebrew/opt/viennarna/bin/RNAplfold",
     "/usr/local/opt/viennarna/bin/RNAplfold",
     "/opt/anaconda3/bin/RNAplfold",
@@ -47,7 +48,9 @@ def check_rnaplfold_installation() -> tuple[bool, str]:
     binary = find_rnaplfold_binary()
     if binary is None:
         return False, (
-            "ViennaRNA RNAplfold was not found. Install ViennaRNA before running this analysis."
+            "ViennaRNA RNAplfold was not found. If this is the cloud app, wait "
+            "for it to finish rebuilding, then click Manage app → Reboot. "
+            "Locally, install ViennaRNA so RNAplfold is on PATH."
         )
     try:
         completed = subprocess.run(
