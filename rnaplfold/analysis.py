@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+import re
 
 import pandas as pd
 
@@ -257,3 +258,96 @@ def summary_row(
         row[f"best_{length}nt_end"] = hit.end if hit else None
         row[f"best_{length}nt_sequence"] = hit.sequence if hit else None
     return row
+
+
+@dataclass(frozen=True)
+class UagCodon:
+    """A UAG/TAG triplet in a sensor, 1-based inclusive coordinates."""
+
+    start: int
+    end: int
+    sequence: str
+    marked: bool
+    in_frame: bool
+
+    @property
+    def label(self) -> str:
+        bits = [f"nt {self.start}–{self.end}"]
+        if self.marked:
+            bits.append("Gao edit site")
+        bits.append("in-frame" if self.in_frame else "out of frame")
+        return ", ".join(bits)
+
+
+def find_uag_codons(sequence: str) -> list[UagCodon]:
+    """Find UAG triplets, preferring a Gao lowercase-a edit marker.
+
+    Gao sensors mark the editable A of the amber codon as lowercase ``a``,
+    so ``TTaG`` / ``UUaG`` is the translated stop. Sensors of length 72 or
+    90 are ORFs from nucleotide 1, so a codon is in-frame when it starts
+    at 1, 4, 7, …
+    """
+    compact = re.sub(r"\s+", "", sequence or "")
+    if len(compact) < 3:
+        return []
+    rna = compact.upper().replace("T", "U")
+    marked_a: set[int] = set()
+    for i, char in enumerate(compact):
+        if char != "a" or i == 0 or i + 1 >= len(compact):
+            continue
+        left = compact[i - 1].upper().replace("T", "U")
+        right = compact[i + 1].upper().replace("T", "U")
+        if left == "U" and right == "G":
+            marked_a.add(i)
+    hits: list[UagCodon] = []
+    for i in range(len(rna) - 2):
+        if rna[i : i + 3] != "UAG":
+            continue
+        hits.append(
+            UagCodon(
+                start=i + 1,
+                end=i + 3,
+                sequence="UAG",
+                marked=(i + 1) in marked_a,
+                in_frame=(i % 3 == 0),
+            )
+        )
+    hits.sort(key=lambda hit: (not hit.marked, not hit.in_frame, hit.start))
+    return hits
+
+
+def uag_codon_exposure(accessibility: pd.DataFrame, codon: UagCodon) -> dict[str, Any]:
+    """RNAplfold exposition of a 3-nt codon.
+
+    ``unpaired_l3`` at the codon’s last nucleotide is P(all three bases
+    unpaired). ``unpaired_l1`` is each letter on its own.
+    """
+    region = accessibility[
+        (accessibility["position"] >= codon.start)
+        & (accessibility["position"] <= codon.end)
+    ].sort_values("position")
+    if region.empty:
+        raise ValueError(
+            f"No RNAplfold rows for UAG coordinates {codon.start}–{codon.end}."
+        )
+    l1_values = [float(value) for value in region["unpaired_l1"].tolist()]
+    letters = [str(nt) for nt in region["nt"].tolist()]
+    p_codon = None
+    if "unpaired_l3" in accessibility.columns:
+        row = accessibility.loc[accessibility["position"] == codon.end]
+        if not row.empty:
+            value = row["unpaired_l3"].iloc[0]
+            if pd.notna(value):
+                p_codon = float(value)
+    return {
+        "p_codon_unpaired": p_codon,
+        "mean_l1": float(sum(l1_values) / len(l1_values)) if l1_values else None,
+        "per_nt": [
+            {
+                "nt": letter,
+                "position": codon.start + offset,
+                "unpaired_l1": prob,
+            }
+            for offset, (letter, prob) in enumerate(zip(letters, l1_values))
+        ],
+    }

@@ -1,0 +1,4 @@
+fornac 1.1.8
+https://github.com/pkerpedjiev/fornac
+https://cdn.jsdelivr.net/npm/fornac@1.1.8/dist/scripts/fornac.js
+https://cdn.jsdelivr.net/npm/fornac@1.1.8/app/styles/fornac.css

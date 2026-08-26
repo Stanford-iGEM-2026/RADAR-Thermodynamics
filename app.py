@@ -25,6 +25,7 @@ import streamlit as st
 
 from accessibility_ui import render_accessibility_tab
 from fasta import render_ncbi_fasta_tab
+from sensor_structure_ui import render_sensor_structure_tab
 
 DB_PATH = Path("radar_candidates.db")
 CATALOG_PATH = Path("gene_catalog.json")
@@ -867,19 +868,20 @@ init_favorites()
 st.title("RADAR gene platform")
 st.write(
     "Enter any human gene symbol, then use the tabs: Gao Lab RADAR designs, "
-    "a saved-candidate collection, Ensembl transcript FASTA, or "
-    "structures and accessibility."
+    "a saved-candidate collection, Ensembl transcript FASTA, "
+    "target accessibility, or sensor RNAfold structure."
 )
 
 # Default is only a convenient test query — nothing else is ADAM12-specific.
 gene = st.text_input("Enter a human gene", value="ADAM12").strip()
 
-radar_tab, saved_tab, fasta_tab, access_tab = st.tabs(
+radar_tab, saved_tab, fasta_tab, access_tab, sensor_tab = st.tabs(
     [
         "RADAR candidates",
         "Saved candidates",
         "Ensembl transcripts (FASTA)",
-        "Structures and Accessibility",
+        "Endogenous accessibility",
+        "Sensor structure (RNAfold)",
     ]
 )
 
@@ -899,3 +901,6 @@ with fasta_tab:
 
 with access_tab:
     render_accessibility_tab()
+
+with sensor_tab:
+    render_sensor_structure_tab()
